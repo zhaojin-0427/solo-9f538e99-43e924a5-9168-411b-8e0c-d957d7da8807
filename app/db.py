@@ -61,10 +61,28 @@ CREATE TABLE IF NOT EXISTS superpositions (
     UNIQUE (site_id, lower_id, upper_id)
 );
 
+-- 叠压登记因年代无解被拒时的“失败现场”复核回执。
+-- 该表只追加、不参与求解，不改变业务表、version 与任何年代结论；
+-- snapshot 自包含当时能复算该冲突的全部原始记录，事后撤销/改写业务记录、
+-- 甚至服务重启，都仍可仅凭 snapshot 复现同一种无解。
+CREATE TABLE IF NOT EXISTS rejection_reviews (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id          INTEGER NOT NULL REFERENCES sites(id),
+    rejected_kind    TEXT NOT NULL DEFAULT 'superposition',
+    lower_stratum_id INTEGER NOT NULL,
+    upper_stratum_id INTEGER NOT NULL,
+    reason           TEXT NOT NULL,
+    message          TEXT NOT NULL,
+    base_version     INTEGER NOT NULL,
+    snapshot         TEXT NOT NULL,
+    created          TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_strata_site ON strata(site_id);
 CREATE INDEX IF NOT EXISTS idx_intervals_stratum ON stratum_intervals(stratum_id);
 CREATE INDEX IF NOT EXISTS idx_corr_site ON correlations(site_id);
 CREATE INDEX IF NOT EXISTS idx_sup_site ON superpositions(site_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_site ON rejection_reviews(site_id);
 """
 
 
@@ -286,3 +304,54 @@ def list_superpositions(
 
 def delete_superposition(conn: sqlite3.Connection, superposition_id: int) -> None:
     conn.execute("DELETE FROM superpositions WHERE id = ?", (superposition_id,))
+
+
+# ---------- 无解复核回执 ----------
+
+def create_rejection_review(
+    conn: sqlite3.Connection,
+    site_id: int,
+    lower_stratum_id: int,
+    upper_stratum_id: int,
+    reason: str,
+    message: str,
+    base_version: int,
+    snapshot_json: str,
+    rejected_kind: str = "superposition",
+) -> sqlite3.Row:
+    """追加一条复核回执。调用方自行决定事务边界（独立事务，不 bump version）。"""
+    cur = conn.execute(
+        "INSERT INTO rejection_reviews("
+        "site_id, rejected_kind, lower_stratum_id, upper_stratum_id, "
+        "reason, message, base_version, snapshot"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            site_id,
+            rejected_kind,
+            lower_stratum_id,
+            upper_stratum_id,
+            reason,
+            message,
+            base_version,
+            snapshot_json,
+        ),
+    )
+    return conn.execute(
+        "SELECT * FROM rejection_reviews WHERE id = ?", (cur.lastrowid,)
+    ).fetchone()
+
+
+def get_rejection_review(
+    conn: sqlite3.Connection, review_id: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM rejection_reviews WHERE id = ?", (review_id,)
+    ).fetchone()
+
+
+def list_rejection_reviews(
+    conn: sqlite3.Connection, site_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM rejection_reviews WHERE site_id = ? ORDER BY id", (site_id,)
+    ).fetchall()

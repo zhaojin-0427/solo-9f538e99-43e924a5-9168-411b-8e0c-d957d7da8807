@@ -7,9 +7,11 @@
 
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 import threading
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -17,11 +19,19 @@ from fastapi.responses import JSONResponse
 from . import db
 from .schemas import (
     CorrelationCreate,
+    RejectionReviewOut,
+    RejectionReviewSummary,
     SiteCreate,
     StratumCreate,
     SuperpositionCreate,
 )
-from .service import load_and_solve, serialize_solution, serialize_stratum
+from .service import (
+    build_rejection_snapshot,
+    load_and_solve,
+    serialize_solution,
+    serialize_stratum,
+    solve_snapshot,
+)
 
 MAX_STRATA_PER_SITE = 40
 
@@ -110,6 +120,35 @@ def create_app(db_path: str | None = None) -> FastAPI:
         """事务内调用：先抓取新视图中的矛盾，再抛异常触发事务回滚。"""
         contradiction = _contradiction_payload(site_id)
         raise _Infeasible((message, contradiction))
+
+    def _persist_rejection_review(
+        site_id: int,
+        lower_id: int,
+        upper_id: int,
+        contradiction: dict[str, Any],
+    ) -> tuple[Optional[int], Optional[str]]:
+        """失败回滚后，在独立事务中留存无解现场并生成复核号。
+
+        不触碰业务表、不 bump version。返回 (复核号, 留存失败原因)；
+        留存失败时复核号为 None，且库内关系保持原样。
+        """
+        base_version = db.get_version(conn)
+        snapshot = build_rejection_snapshot(conn, site_id, lower_id, upper_id)
+        try:
+            with db.transaction(conn):
+                row = db.create_rejection_review(
+                    conn,
+                    site_id=site_id,
+                    lower_stratum_id=lower_id,
+                    upper_stratum_id=upper_id,
+                    reason=contradiction["reason"],
+                    message=contradiction["message"],
+                    base_version=base_version,
+                    snapshot_json=json.dumps(snapshot, ensure_ascii=False),
+                )
+            return row["id"], None
+        except sqlite3.Error as exc:  # 留存失败：说明原因，不给复核号
+            return None, f"复核回执留存失败：{exc}"
 
     # ---------- 遗址 ----------
 
@@ -263,13 +302,21 @@ def create_app(db_path: str | None = None) -> FastAPI:
                         )
             except _Infeasible as exc:
                 message, contradiction = exc.args[0]
-                raise ConflictError(
-                    message,
-                    {
-                        "contradiction": contradiction,
-                        "previous_solution": _solution_payload(site_id),
-                    },
+                # 回滚已完成：库内关系、version 与年代结论均未改变。
+                # 独立事务留存失败现场并生成复核号；留存失败则说明原因且不给号。
+                review_id, review_error = _persist_rejection_review(
+                    site_id, body.lower_id, body.upper_id, contradiction
                 )
+                details = {
+                    "contradiction": contradiction,
+                    "previous_solution": _solution_payload(site_id),
+                    "rejected_lower_stratum_id": body.lower_id,
+                    "rejected_upper_stratum_id": body.upper_id,
+                    "review_id": review_id,
+                }
+                if review_error is not None:
+                    details["review_persistence_error"] = review_error
+                raise ConflictError(message, details)
             return {"record": dict(row), "solution": _solution_payload(site_id)}
 
     @app.get("/sites/{site_id}/superpositions", tags=["superpositions"])
@@ -326,6 +373,84 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "latest_year": group.latest_year,
             "contradiction": serialize_solution(solution, version)["contradiction"],
         }
+
+    # ---------- 无解复核 ----------
+
+    def _serialize_review(row) -> dict[str, Any]:
+        snapshot = json.loads(row["snapshot"])
+        # 仅凭返回记录现场复算：即使后来撤销对接、同一叠压成功入库或重启，
+        # 复算结果仍与首次被拒时是同一种无解。
+        recomputed = solve_snapshot(snapshot)
+        return {
+            "review_id": row["id"],
+            "site_id": row["site_id"],
+            "rejected_kind": row["rejected_kind"],
+            "created": row["created"],
+            "base_version": row["base_version"],
+            "current_version": db.get_version(conn),
+            "reason": row["reason"],
+            "message": row["message"],
+            "rejected_superposition": {
+                "lower_stratum_id": row["lower_stratum_id"],
+                "upper_stratum_id": row["upper_stratum_id"],
+            },
+            # 失败现场：被拒关系 status=rejected，当时已登记关系 status=registered，
+            # 两类关系分别标明；整个快照自包含，可离线复算。
+            "snapshot": snapshot,
+            "recomputed": {
+                "feasible": recomputed.feasible,
+                "contradiction": (
+                    None
+                    if recomputed.contradiction is None
+                    else {
+                        "reason": recomputed.contradiction.reason,
+                        "message": recomputed.contradiction.message,
+                        "witness": [
+                            {
+                                "kind": w.kind,
+                                "record_id": w.record_id,
+                                "detail": w.detail,
+                            }
+                            for w in recomputed.contradiction.witness
+                        ],
+                    }
+                ),
+            },
+        }
+
+    @app.get("/reviews/{review_id}", tags=["reviews"], response_model=RejectionReviewOut)
+    def get_rejection_review(review_id: int):
+        """凭复核号查询无解原因、被拒上下层 ID 与可复算的失败现场。"""
+        row = db.get_rejection_review(conn, review_id)
+        if row is None:
+            raise HTTPException(404, f"复核号 {review_id} 不存在")
+        with write_lock:
+            return _serialize_review(row)
+
+    @app.get(
+        "/sites/{site_id}/reviews",
+        tags=["reviews"],
+        response_model=list[RejectionReviewSummary],
+    )
+    def list_rejection_reviews(site_id: int):
+        """遗址下全部叠压无解复核回执（不含快照明细，凭号走 /reviews/{id}）。"""
+        _require_site(site_id)
+        return [
+            {
+                "review_id": r["id"],
+                "site_id": r["site_id"],
+                "rejected_kind": r["rejected_kind"],
+                "created": r["created"],
+                "base_version": r["base_version"],
+                "reason": r["reason"],
+                "message": r["message"],
+                "rejected_superposition": {
+                    "lower_stratum_id": r["lower_stratum_id"],
+                    "upper_stratum_id": r["upper_stratum_id"],
+                },
+            }
+            for r in db.list_rejection_reviews(conn, site_id)
+        ]
 
     @app.exception_handler(ConflictError)
     def _conflict_handler(_request, exc: ConflictError):

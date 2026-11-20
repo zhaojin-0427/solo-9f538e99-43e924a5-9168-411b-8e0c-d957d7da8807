@@ -124,3 +124,76 @@ class WriteResult(BaseModel):
 
     record: dict
     solution: SolutionOut
+
+
+# ---------- 无解复核 ----------
+
+class RejectedSuperpositionRef(BaseModel):
+    lower_stratum_id: int
+    upper_stratum_id: int
+
+
+class SnapshotSuperposition(BaseModel):
+    id: int = Field(..., description="记录 id；被拒候选为保留 id 0（从未入库）")
+    lower_id: int
+    upper_id: int
+    status: str = Field(
+        ..., description="registered=当时已登记；rejected=本次被拒的候选"
+    )
+
+
+class SnapshotCorrelation(BaseModel):
+    id: int
+    stratum_a_id: int
+    stratum_b_id: int
+    status: str = Field("registered", description="快照内对接均为当时已登记关系")
+
+
+class SnapshotStratum(BaseModel):
+    id: int
+    trench: str
+    layer_no: str
+    note: Optional[str]
+    intervals: list[IntervalIn]
+
+
+class RejectionSnapshot(BaseModel):
+    """自包含失败现场：仅凭本对象即可离线复算同一种无解。"""
+
+    site_id: int
+    strata: list[SnapshotStratum]
+    correlations: list[SnapshotCorrelation]
+    superpositions: list[SnapshotSuperposition]
+    rejected_superposition_id: int = Field(
+        ..., description="被拒候选在快照中的 id（固定为 0）"
+    )
+
+
+class RecomputedResult(BaseModel):
+    feasible: bool
+    contradiction: Optional[ContradictionOut] = None
+
+
+class RejectionReviewOut(BaseModel):
+    review_id: int
+    site_id: int
+    rejected_kind: str
+    created: str
+    base_version: int = Field(..., description="被拒发生时的库内版本（无解登记不改版本）")
+    current_version: int = Field(..., description="查询时的库内版本，便于对照事后变化")
+    reason: str
+    message: str
+    rejected_superposition: RejectedSuperpositionRef
+    snapshot: RejectionSnapshot
+    recomputed: RecomputedResult
+
+
+class RejectionReviewSummary(BaseModel):
+    review_id: int
+    site_id: int
+    rejected_kind: str
+    created: str
+    base_version: int
+    reason: str
+    message: str
+    rejected_superposition: RejectedSuperpositionRef

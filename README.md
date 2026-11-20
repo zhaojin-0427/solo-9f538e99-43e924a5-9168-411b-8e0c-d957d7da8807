@@ -51,6 +51,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/sites/{id}/superpositions` | 登记叠压（下层 → 上层） |
 | GET | `/sites/{id}/superpositions` | 叠压列表 |
 | DELETE | `/superpositions/{id}` | 撤销叠压并重算 |
+| GET | `/sites/{id}/reviews` | 该遗址全部叠压无解复核回执（摘要） |
+| GET | `/reviews/{复核号}` | 凭号查询无解原因、被拒上下层 ID 与可复算失败现场 |
 | GET | `/sites/{id}/solution` | 整站分组、组间边、各组全部可行年代段 |
 | GET | `/strata/{id}/correlation-view` | 按原始层位查同组成员与可行年代段 |
 
@@ -77,9 +79,34 @@ curl -X POST localhost:8000/sites/$SID/correlations \
 写入会在**同一事务**内先重算再提交。若新记录导致无解（`EMPTY_DOMAIN` /
 `GROUP_CYCLE` / `ORDER_CONFLICT`），事务回滚，接口返回 `409`，响应体包含：
 
+- `detail`：可读的拒绝原因；
 - `contradiction`：一组本身即矛盾的**原始记录见证**（层位年代段、对接、叠压，
   含可读原因与记录 id，便于定位）；
 - `previous_solution`：回滚后库内已有对接与年代结论（保持可行、保持可用）。
+
+### 叠压无解的复核回执（交班场景）
+
+叠压登记因年代无解被拒时，除保留上述全部 409 字段外，还会在**独立事务**中
+把“失败现场”追加到 `rejection_reviews` 表，并在响应里另给当次 `review_id`
+（复核号），同时回显 `rejected_lower_stratum_id` / `rejected_upper_stratum_id`。
+若回执本身留存失败（如磁盘错误），响应给 `review_persistence_error` 说明原因、
+`review_id` 为 `null`，且不留下任何半条记录。
+
+`GET /reviews/{review_id}` 凭号返回：
+
+- `reason` / `message`：无解原因（`EMPTY_DOMAIN` / `GROUP_CYCLE` /
+  `ORDER_CONFLICT`）与可读说明；
+- `rejected_superposition`：被拒叠压的下层、上层层位 ID；
+- `snapshot`：当时能复算该冲突的**自包含**原始记录——全部层位及其原始年代段、
+  当时已登记的对接与叠压（`status="registered"`）和被拒候选
+  （`status="rejected"`，保留 id `0`，从未入库），两类关系分别标明；
+- `recomputed`：服务端仅凭 `snapshot` 现场复算的结果，与首次被拒是同一种无解；
+  复核员也可以只拿返回的 `snapshot` 离线喂给求解器复算，无需访问业务库；
+- `base_version` / `current_version`：被拒发生时与查询时的库内版本，便于对照。
+
+即使后来撤销了冲突对接、同一条叠压成功入库，或服务重启，复核号始终有效，
+首次查询仍能仅凭返回记录复现同一种无解。无解登记**只追加回执**：不改变库内
+业务关系、不增加 `version`、不改变任何年代结论。
 
 ## 一致性与并发
 
@@ -107,4 +134,6 @@ python -m pytest tests/ -q
 ```
 
 覆盖区间工具、缺口域求解、成环/空域/次序冲突及矛盾见证、40 层上限、
-无解拒绝与旧结论保留、撤销重算、并发写入串行化、重启后结论恢复。
+无解拒绝与旧结论保留、撤销重算、并发写入串行化、重启后结论恢复；
+另含叠压无解复核：复核号发放与留存失败处理、被拒/已登记关系分标、
+仅凭快照离线复算、撤销与重启后复现、库内关系与版本不变。
